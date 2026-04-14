@@ -837,70 +837,48 @@ class FlashAttentionBackend(AttentionBackend):
                 return output
             else:
                 assert self.fa_impl_ver in [3, 4], "Only FA3 and FA4 support MLA here"
-                # Do absorbed multi-latent attention
-                kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
-                    layer.layer_id
-                ).to(q.dtype)
-                k_rope = kv_cache[:, :, layer.v_head_dim :]
-                c_kv = kv_cache[:, :, : layer.v_head_dim]
-                k_rope_cache = k_rope.view(
-                    -1,
-                    self.page_size,
-                    layer.tp_k_head_num,
-                    layer.head_dim - layer.v_head_dim,
+                k_rope_cache, c_kv_cache = self._get_mla_kv_cache(
+                    forward_batch, layer, q.dtype
                 )
-                c_kv_cache = c_kv.view(
-                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-                )
-                if q_rope is not None:
-                    q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                    q_rope = q_rope.view(
-                        -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
-                    )
-                else:
-                    q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-                    q_nope = q_all[:, :, : layer.v_head_dim]
-                    q_rope = q_all[:, :, layer.v_head_dim :]
+                q_nope, q_rope = self._split_mla_query(q, q_rope, layer)
 
-                result = flash_attn_with_kvcache(
-                    q=q_rope,
-                    k_cache=k_rope_cache,
-                    v_cache=c_kv_cache,
-                    qv=q_nope,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
-                    max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
+                result = self._run_mla_attention(
+                    flash_attn_with_kvcache,
+                    q_nope=q_nope,
+                    q_rope=q_rope,
+                    k_rope_cache=k_rope_cache,
+                    c_kv_cache=c_kv_cache,
+                    metadata=metadata,
+                    layer=layer,
                     causal=False if use_cascade_attn else causal,
-                    softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
-                    num_splits=self.num_splits,
+                    use_local_attn=use_local_attn,
                 )
                 if use_cascade_attn:
-                    o, softmax_lse, *rest = result
+                    o, softmax_lse, *rest = self._run_mla_verify_phase1(
+                        flash_attn_with_kvcache,
+                        q_nope=q_nope,
+                        q_rope=q_rope,
+                        k_rope_cache=k_rope_cache,
+                        c_kv_cache=c_kv_cache,
+                        layer=layer,
+                        metadata=metadata,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        use_local_attn=use_local_attn,
+                    )
                     o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
-                            q=q_rope,
-                            k_cache=k_rope_cache,
-                            v_cache=c_kv_cache,
-                            qv=q_nope,
-                            page_table=self.forward_metadata_spec_decode_expand.page_table,
-                            cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                            cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                            cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                            max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                            softmax_scale=layer.scaling,
-                            causal=False,
-                            window_size=window_size,
-                            softcap=layer.logit_cap,
+                        self._run_mla_verify_phase2(
+                            flash_attn_with_kvcache,
+                            q_nope=q_nope,
+                            q_rope=q_rope,
+                            k_rope_cache=k_rope_cache,
+                            c_kv_cache=c_kv_cache,
+                            layer=layer,
                             k_descale=k_descale,
                             v_descale=v_descale,
-                            return_softmax_lse=True,
-                            num_splits=self.num_splits,
                         )
                     )
                     o, _ = merge_state_v2_wrapper(
@@ -1115,70 +1093,48 @@ class FlashAttentionBackend(AttentionBackend):
                     o = result
         else:
             # Do absorbed multi-latent attention
-            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                q.dtype
+            k_rope_cache, c_kv_cache = self._get_mla_kv_cache(
+                forward_batch, layer, q.dtype
             )
-            k_rope = kv_cache[:, :, layer.v_head_dim :]
-            c_kv = kv_cache[:, :, : layer.v_head_dim]
-            k_rope_cache = k_rope.view(
-                -1,
-                self.page_size,
-                layer.tp_k_head_num,
-                layer.head_dim - layer.v_head_dim,
-            )
-            c_kv_cache = c_kv.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-            )
+            q_nope, q_rope = self._split_mla_query(q, q_rope, layer)
 
-            if q_rope is not None:
-                q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                q_rope = q_rope.view(
-                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
-                )
-            else:
-                q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-                q_nope = q_all[:, :, : layer.v_head_dim]
-                q_rope = q_all[:, :, layer.v_head_dim :]
-            max_seqlen_q = metadata.max_seq_len_q
-
-            result = flash_attn_with_kvcache(
-                q=q_rope,
-                k_cache=k_rope_cache,
-                v_cache=c_kv_cache,
-                qv=q_nope,
-                page_table=metadata.page_table,
-                cache_seqlens=metadata.cache_seqlens_int32,
-                cu_seqlens_q=metadata.cu_seqlens_q,
-                cu_seqlens_k_new=metadata.cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                softmax_scale=layer.scaling,
+            result = self._run_mla_attention(
+                flash_attn_with_kvcache,
+                q_nope=q_nope,
+                q_rope=q_rope,
+                k_rope_cache=k_rope_cache,
+                c_kv_cache=c_kv_cache,
+                metadata=metadata,
+                layer=layer,
                 causal=False if use_cascade_attn else causal,
-                softcap=layer.logit_cap,
                 k_descale=k_descale,
                 v_descale=v_descale,
-                return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
-                num_splits=self.num_splits,
+                return_softmax_lse=use_cascade_attn,
+                window_size=window_size,
             )
             if use_cascade_attn:
-                o, softmax_lse, *rest = result
-                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
-                    q=q_rope,
-                    k_cache=k_rope_cache,
-                    v_cache=c_kv_cache,
-                    qv=q_nope,
-                    page_table=self.forward_metadata_spec_decode_expand.page_table,
-                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                    cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                    softmax_scale=layer.scaling,
-                    causal=False,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
+                o, softmax_lse, *rest = self._run_mla_verify_phase1(
+                    flash_attn_with_kvcache,
+                    q_nope=q_nope,
+                    q_rope=q_rope,
+                    k_rope_cache=k_rope_cache,
+                    c_kv_cache=c_kv_cache,
+                    layer=layer,
+                    metadata=metadata,
                     k_descale=k_descale,
                     v_descale=v_descale,
-                    return_softmax_lse=True,
-                    num_splits=self.num_splits,
+                    window_size=window_size,
+                )
+                o_expand, softmax_lse_expand, *rest_expand = self._run_mla_verify_phase2(
+                    flash_attn_with_kvcache,
+                    q_nope=q_nope,
+                    q_rope=q_rope,
+                    k_rope_cache=k_rope_cache,
+                    c_kv_cache=c_kv_cache,
+                    layer=layer,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    window_size=window_size,
                 )
                 o, _ = merge_state_v2(
                     o,
@@ -1729,6 +1685,144 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
         self.forward_metadata_spec_decode_expand = metadata_expand
+
+    def _get_mla_kv_cache(
+        self,
+        forward_batch: ForwardBatch,
+        layer: RadixAttention,
+        q_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+            q_dtype
+        )
+        k_rope = kv_cache[:, :, layer.v_head_dim :]
+        c_kv = kv_cache[:, :, : layer.v_head_dim]
+        k_rope_cache = k_rope.view(
+            -1,
+            self.page_size,
+            layer.tp_k_head_num,
+            layer.head_dim - layer.v_head_dim,
+        )
+        c_kv_cache = c_kv.view(
+            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
+        return k_rope_cache, c_kv_cache
+
+    def _split_mla_query(
+        self,
+        q: torch.Tensor,
+        q_rope: Optional[torch.Tensor],
+        layer: RadixAttention,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if q_rope is not None:
+            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+        else:
+            q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            q_nope = q_all[:, :, : layer.v_head_dim]
+            q_rope = q_all[:, :, layer.v_head_dim :]
+        return q_nope, q_rope
+
+    def _run_mla_attention(
+        self,
+        flash_attn_with_kvcache,
+        *,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_rope_cache: torch.Tensor,
+        c_kv_cache: torch.Tensor,
+        metadata: FlashAttentionMetadata,
+        layer: RadixAttention,
+        causal: bool,
+        k_descale: Optional[torch.Tensor],
+        v_descale: Optional[torch.Tensor],
+        return_softmax_lse: bool,
+        window_size: tuple[int, int] = (-1, -1),
+        use_local_attn: bool = False,
+    ):
+        return flash_attn_with_kvcache(
+            q=q_rope,
+            k_cache=k_rope_cache,
+            v_cache=c_kv_cache,
+            qv=q_nope,
+            page_table=metadata.page_table,
+            cache_seqlens=metadata.cache_seqlens_int32,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            cu_seqlens_k_new=metadata.cu_seqlens_k if not use_local_attn else None,
+            max_seqlen_q=metadata.max_seq_len_q,
+            softmax_scale=layer.scaling,
+            causal=causal,
+            window_size=window_size,
+            softcap=layer.logit_cap,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            return_softmax_lse=return_softmax_lse,
+            num_splits=self.num_splits,
+        )
+
+    def _run_mla_verify_phase1(
+        self,
+        flash_attn_with_kvcache,
+        *,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_rope_cache: torch.Tensor,
+        c_kv_cache: torch.Tensor,
+        layer: RadixAttention,
+        metadata: FlashAttentionMetadata,
+        k_descale: Optional[torch.Tensor],
+        v_descale: Optional[torch.Tensor],
+        window_size: tuple[int, int] = (-1, -1),
+        use_local_attn: bool = False,
+    ):
+        # This is the intended phase-1 insertion point for a specialized MLA
+        # target-verify kernel. Keep the surrounding cascade orchestration stable.
+        return self._run_mla_attention(
+            flash_attn_with_kvcache,
+            q_nope=q_nope,
+            q_rope=q_rope,
+            k_rope_cache=k_rope_cache,
+            c_kv_cache=c_kv_cache,
+            metadata=metadata,
+            layer=layer,
+            causal=False,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            return_softmax_lse=True,
+            window_size=window_size,
+            use_local_attn=use_local_attn,
+        )
+
+    def _run_mla_verify_phase2(
+        self,
+        flash_attn_with_kvcache,
+        *,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_rope_cache: torch.Tensor,
+        c_kv_cache: torch.Tensor,
+        layer: RadixAttention,
+        k_descale: Optional[torch.Tensor],
+        v_descale: Optional[torch.Tensor],
+        window_size: tuple[int, int] = (-1, -1),
+    ):
+        return self._run_mla_attention(
+            flash_attn_with_kvcache,
+            q_nope=q_nope,
+            q_rope=q_rope,
+            k_rope_cache=k_rope_cache,
+            c_kv_cache=c_kv_cache,
+            metadata=self.forward_metadata_spec_decode_expand,
+            layer=layer,
+            causal=False,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            return_softmax_lse=True,
+            window_size=window_size,
+            use_local_attn=False,
+        )
 
     def init_forward_metadata_replay_cuda_graph(
         self,
