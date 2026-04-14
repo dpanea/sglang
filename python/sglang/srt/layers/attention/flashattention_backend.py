@@ -188,6 +188,20 @@ class FlashAttentionBackend(AttentionBackend):
             else 0
         )
 
+        if self.use_mla and self.fa_impl_ver == 4:
+            if self.page_size != 1:
+                raise ValueError(
+                    "FA4 MLA prototype requires --page-size 1."
+                )
+            if self.kv_cache_dtype != torch.bfloat16:
+                raise ValueError(
+                    "FA4 MLA prototype requires BF16 KV cache; launch with --kv-cache-dtype bf16."
+                )
+            if not model_runner.server_args.disable_cuda_graph:
+                raise ValueError(
+                    "FA4 MLA prototype requires --disable-cuda-graph."
+                )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
@@ -822,7 +836,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return output, lse
                 return output
             else:
-                assert self.fa_impl_ver in [3], "Only FA3 support here"
+                assert self.fa_impl_ver in [3, 4], "Only FA3 and FA4 support MLA here"
                 # Do absorbed multi-latent attention
                 kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
                     layer.layer_id

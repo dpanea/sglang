@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Callable, Optional, Tuple, Union
 
 import torch
@@ -17,6 +18,126 @@ else:
 
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _apply_softcap(scores: torch.Tensor, softcap: float) -> torch.Tensor:
+    if softcap > 0.0:
+        scores = torch.tanh(scores / softcap) * softcap
+    return scores
+
+
+def _mla_attention_ref_paged(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    softmax_scale: Optional[float],
+    causal: bool,
+    softcap: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if page_table is None:
+        raise RuntimeError("FA4 MLA prototype requires page_table metadata.")
+    if cache_seqlens is None:
+        raise RuntimeError("FA4 MLA prototype requires cache_seqlens metadata.")
+    if cu_seqlens_q is None:
+        raise RuntimeError("FA4 MLA prototype requires cu_seqlens_q metadata.")
+    if k_cache.shape[1] != 1 or v_cache.shape[1] != 1:
+        raise RuntimeError("FA4 MLA prototype requires --page-size 1.")
+    if k_cache.shape[2] != 1 or v_cache.shape[2] != 1:
+        raise RuntimeError(
+            "FA4 MLA prototype requires a single KV head (MQA-style MLA cache)."
+        )
+    if (
+        q_nope.dtype != torch.bfloat16
+        or q_rope.dtype != torch.bfloat16
+        or k_cache.dtype != torch.bfloat16
+        or v_cache.dtype != torch.bfloat16
+    ):
+        raise RuntimeError(
+            "FA4 MLA prototype requires BF16 Q/KV tensors; launch with --kv-cache-dtype bf16."
+        )
+
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+    if get_is_capture_mode():
+        raise RuntimeError(
+            "FA4 MLA prototype does not support CUDA graph capture; launch with --disable-cuda-graph."
+        )
+
+    num_batches = cu_seqlens_q.numel() - 1
+    if cache_seqlens.numel() != num_batches:
+        raise RuntimeError(
+            "FA4 MLA prototype expected cache_seqlens to match cu_seqlens_q batch count."
+        )
+    if page_table.shape[0] != num_batches:
+        raise RuntimeError(
+            "FA4 MLA prototype expected page_table rows to match cu_seqlens_q batch count."
+        )
+
+    output = torch.zeros_like(q_nope)
+    softmax_lse = torch.full(
+        (q_nope.shape[1], q_nope.shape[0]),
+        -torch.inf,
+        dtype=torch.float32,
+        device=q_nope.device,
+    )
+
+    k_cache_flat = k_cache.reshape(-1, k_cache.shape[-1]).float()
+    v_cache_flat = v_cache.reshape(-1, v_cache.shape[-1]).float()
+    softmax_scale = softmax_scale or (
+        1.0 / math.sqrt(q_nope.shape[-1] + q_rope.shape[-1])
+    )
+
+    for batch_idx in range(num_batches):
+        q_start = int(cu_seqlens_q[batch_idx].item())
+        q_end = int(cu_seqlens_q[batch_idx + 1].item())
+        q_len = q_end - q_start
+        kv_len = int(cache_seqlens[batch_idx].item())
+
+        if q_len == 0:
+            continue
+        if kv_len == 0:
+            continue
+        if page_table.shape[1] < kv_len:
+            raise RuntimeError(
+                "FA4 MLA prototype expected page_table width to cover cache_seqlens."
+            )
+        if causal and kv_len < q_len:
+            raise RuntimeError(
+                "FA4 MLA prototype expected causal MLA calls to satisfy kv_len >= q_len."
+            )
+
+        token_indices = page_table[batch_idx, :kv_len].to(dtype=torch.long)
+        k_seq = k_cache_flat.index_select(0, token_indices)
+        v_seq = v_cache_flat.index_select(0, token_indices)
+
+        q_nope_seq = q_nope[q_start:q_end].float()
+        q_rope_seq = q_rope[q_start:q_end].float()
+        scores = torch.einsum("qhd,kd->hqk", q_nope_seq, v_seq)
+        scores = scores + torch.einsum("qhd,kd->hqk", q_rope_seq, k_seq)
+        scores = _apply_softcap(scores * softmax_scale, softcap)
+
+        if causal:
+            max_key_index = kv_len - q_len + torch.arange(
+                q_len, device=scores.device, dtype=torch.long
+            )
+            key_index = torch.arange(kv_len, device=scores.device, dtype=torch.long)
+            causal_mask = key_index.unsqueeze(0) <= max_key_index.unsqueeze(1)
+            scores = scores.masked_fill(
+                ~causal_mask.unsqueeze(0), torch.finfo(scores.dtype).min
+            )
+
+        lse = torch.logsumexp(scores, dim=-1)
+        probs = torch.softmax(scores, dim=-1)
+        output[q_start:q_end] = torch.einsum("hqk,kd->qhd", probs, v_seq).to(
+            dtype=q_nope.dtype
+        )
+        softmax_lse[:, q_start:q_end] = lse
+
+    return output, softmax_lse
 
 
 @debug_kernel_api
@@ -130,7 +251,49 @@ def flash_attn_with_kvcache(
     return_softmax_lse: bool = False,
     **_: object,
 ):
-    if k is not None or v is not None or qv is not None:
+    if qv is not None:
+        if k is not None or v is not None:
+            raise NotImplementedError(
+                "FA4 MLA prototype does not support updating KV cache in-place."
+            )
+        if rotary_cos is not None or rotary_sin is not None or rotary_seqlens is not None:
+            raise NotImplementedError("FA4 MLA prototype does not support rotary embedding.")
+        if cache_batch_idx is not None or cache_leftpad is not None:
+            raise NotImplementedError(
+                "FA4 MLA prototype does not support non-consecutive batch indices or left padding."
+            )
+        if q_descale is not None or k_descale is not None or v_descale is not None:
+            raise NotImplementedError("FA4 MLA prototype does not support descale.")
+
+        if isinstance(cache_seqlens, int):
+            if cu_seqlens_q is None:
+                raise RuntimeError(
+                    "FA4 MLA prototype cannot expand scalar cache_seqlens without cu_seqlens_q."
+                )
+            cache_seqlens = torch.full(
+                (cu_seqlens_q.numel() - 1,),
+                cache_seqlens,
+                dtype=torch.int32,
+                device=q.device,
+            )
+
+        output, softmax_lse = _mla_attention_ref_paged(
+            q_nope=qv,
+            q_rope=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            softcap=softcap,
+        )
+        if return_softmax_lse:
+            return output, softmax_lse
+        return output
+
+    if k is not None or v is not None:
         raise NotImplementedError("FA4 does not support updating KV cache in-place.")
     if rotary_cos is not None or rotary_sin is not None or rotary_seqlens is not None:
         raise NotImplementedError("FA4 path does not support rotary embedding.")
